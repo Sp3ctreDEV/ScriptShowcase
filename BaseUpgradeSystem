@@ -1,0 +1,559 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local ServerScriptService = game:GetService("ServerScriptService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local basesFolder = workspace:WaitForChild("Bases")
+local templatesFolder = ReplicatedStorage:WaitForChild("BaseTemplates")
+
+local OWNER_ATTRIBUTE = "OwnerUserId"
+local ASSIGNED_BASE_ATTRIBUTE = "AssignedBaseName"
+
+local REMOTE_NAME = "BaseUpgradeEvent"
+local DATASTORE_NAME = "PlayerBaseLevelV1"
+
+local MAX_LEVEL = 3
+
+local levelCosts: { [number]: number } = {
+	[2] = 5_000_000_000,
+	[3] = 2_500_000_000_000,
+}
+
+local levelMultipliers: { [number]: number } = {
+	[1] = 1,
+	[2] = 1.5,
+	[3] = 2,
+}
+
+local store = DataStoreService:GetDataStore(DATASTORE_NAME)
+
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not remote then
+	remote = Instance.new("RemoteEvent")
+	remote.Name = REMOTE_NAME
+	remote.Parent = ReplicatedStorage
+end
+if not remote:IsA("RemoteEvent") then
+	error("ReplicatedStorage.BaseUpgradeEvent must be a RemoteEvent")
+end
+
+local loadedLevelByUserId: { [number]: number } = {}
+
+local moneyServiceModule = ServerScriptService:FindFirstChild("MoneyService")
+local MoneyService = nil
+if moneyServiceModule and moneyServiceModule:IsA("ModuleScript") then
+	local ok, result = pcall(function()
+		return require(moneyServiceModule)
+	end)
+	if ok and type(result) == "table" then
+		MoneyService = result
+	end
+end
+
+local connsByUserId: { [number]: { RBXScriptConnection } } = {}
+
+local function safeGetMoneyServiceMultiplier(player: Player): number
+	if MoneyService and type(MoneyService.GetMoneyMultiplier) == "function" then
+		local ok, mult = pcall(function()
+			return MoneyService.GetMoneyMultiplier(player)
+		end)
+		if ok and typeof(mult) == "number" and mult == mult and mult > 0 and mult ~= math.huge and mult ~= -math.huge then
+			return mult
+		end
+	end
+	return 1
+end
+
+local function formatMultiplierText(mult: number): string
+	if typeof(mult) ~= "number" or mult ~= mult or mult == math.huge or mult == -math.huge or mult <= 0 then
+		mult = 1
+	end
+	local roundedInt = math.floor(mult + 0.5)
+	if math.abs(mult - roundedInt) < 1e-3 then
+		return tostring(roundedInt).. "x Money"
+	end
+	local s = string.format("%.2f", mult)
+	s = string.gsub(s, "%.?0+$", "")
+	return s.. "x Money"
+end
+
+local function clampLevel(v: any): number
+	local n = tonumber(v) or 1
+	n = math.floor(n)
+	if n < 1 then
+		n = 1
+	elseif n > MAX_LEVEL then
+		n = MAX_LEVEL
+	end
+	return n
+end
+
+local function clampMoney(v: number): number
+	if typeof(v) ~= "number" or v ~= v or v == math.huge or v == -math.huge then
+		return 0
+	end
+	v = math.floor(v + 0.000001)
+	if v < 0 then
+		v = 0
+	end
+	return v
+end
+
+local function formatShortNumber(n: number): string
+	if typeof(n) ~= "number" or n ~= n or n == math.huge or n == -math.huge then
+		return "0"
+	end
+	if n < 0 then
+		n = 0
+	end
+	n = math.floor(n + 0.000001)
+	local suffix = ""
+	local scale = 1
+	if n >= 1e12 then
+		suffix = "T"
+		scale = 1e12
+	elseif n >= 1e9 then
+		suffix = "B"
+		scale = 1e9
+	elseif n >= 1e6 then
+		suffix = "M"
+		scale = 1e6
+	elseif n >= 1e3 then
+		suffix = "K"
+		scale = 1e3
+	end
+	if scale == 1 then
+		return tostring(n)
+	end
+	local scaled = n / scale
+	local truncated = math.floor(scaled * 10) / 10
+	local intPart = math.floor(truncated + 1e-9)
+	local hasDecimal = math.abs(truncated - intPart) > 1e-9
+	if hasDecimal then
+		return string.format("%.1f", truncated).. suffix
+	else
+		return tostring(intPart).. suffix
+	end
+end
+
+local function formatMoney(n: number): string
+	return "$".. formatShortNumber(n)
+end
+
+local function getMoneyValue(player: Player): NumberValue?
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if not leaderstats then
+		leaderstats = player:WaitForChild("leaderstats", 10)
+	end
+	if not leaderstats or not leaderstats:IsA("Folder") then
+		return nil
+	end
+	local money = leaderstats:FindFirstChild("Money")
+	if not money then
+		money = leaderstats:WaitForChild("Money", 10)
+	end
+	if money and money:IsA("NumberValue") then
+		return money
+	end
+	return nil
+end
+
+local function getTemplateFolder(level: number): Folder
+	local name = "Level".. tostring(level)
+	local inst = templatesFolder:FindFirstChild(name)
+	if not inst or not inst:IsA("Folder") then
+		error("Missing template folder: ReplicatedStorage.BaseTemplates.".. name)
+	end
+	return inst
+end
+
+local function getDirectPart(container: Instance, partName: string, context: string): BasePart
+	local inst = container:FindFirstChild(partName)
+	if not inst or not inst:IsA("BasePart") then
+		error(context.. " missing direct child BasePart named ".. partName.. ": ".. container:GetFullName())
+	end
+	return inst
+end
+
+local function applyTransformToInstance(inst: Instance, transform: CFrame)
+	if inst:IsA("BasePart") then
+		inst.CFrame = transform * inst.CFrame
+		return
+	end
+	if inst:IsA("Model") then
+		inst:PivotTo(transform * inst:GetPivot())
+		return
+	end
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.CFrame = transform * d.CFrame
+		end
+	end
+end
+
+local function getOrCreateStandsFolder(baseModel: Model): Folder
+	local stands = baseModel:FindFirstChild("Stands")
+	if stands and stands:IsA("Folder") then
+		return stands
+	end
+	stands = Instance.new("Folder")
+	stands.Name = "Stands"
+	stands.Parent = baseModel
+	return stands
+end
+
+local function findOwnedBaseByOwnerId(userId: number): Model?
+	for _, baseModel in ipairs(basesFolder:GetChildren()) do
+		if baseModel:IsA("Model") then
+			local owner = baseModel:GetAttribute(OWNER_ATTRIBUTE)
+			if owner == userId then
+				return baseModel
+			end
+		end
+	end
+	return nil
+end
+
+local function getPlayersBaseModel(player: Player): Model?
+	local baseName = player:GetAttribute(ASSIGNED_BASE_ATTRIBUTE)
+	if typeof(baseName) == "string" and baseName ~= "" then
+		local baseModel = basesFolder:FindFirstChild(baseName)
+		if baseModel and baseModel:IsA("Model") then
+			return baseModel
+		end
+	end
+	local owned = findOwnedBaseByOwnerId(player.UserId)
+	if owned then
+		player:SetAttribute(ASSIGNED_BASE_ATTRIBUTE, owned.Name)
+	end
+	return owned
+end
+
+local setMoneyMultiplierLabel = nil
+
+local function refreshMoneyMultiplierSignForPlayer(player: Player)
+	if type(setMoneyMultiplierLabel) ~= "function" then
+		return
+	end
+	local baseModel = getPlayersBaseModel(player)
+	if not baseModel or not baseModel:IsA("Model") then
+		return
+	end
+	if baseModel:GetAttribute(OWNER_ATTRIBUTE) ~= player.UserId then
+		return
+	end
+	local baseLevel = clampLevel(loadedLevelByUserId[player.UserId] or baseModel:GetAttribute("BaseLevel"))
+	setMoneyMultiplierLabel(baseModel, baseLevel)
+end
+
+local function ensureAddonsFolder(baseModel: Model, name: string): Folder
+	local existing = baseModel:FindFirstChild(name)
+	if existing then
+		existing:Destroy()
+	end
+	local f = Instance.new("Folder")
+	f.Name = name
+	f.Parent = baseModel
+	return f
+end
+
+local function getUniqueStandName(originalName: string, level: number): string
+	return originalName.. "_L".. tostring(level)
+end
+
+setMoneyMultiplierLabel = function(baseModel: Model, baseLevel: number)
+	local baseSign = baseModel:FindFirstChild("BaseSign")
+	if not baseSign then
+		return
+	end
+	local main = baseSign:FindFirstChild("Main")
+	if not main or not main:IsA("BasePart") then
+		return
+	end
+	local surfaceGui = main:FindFirstChild("SurfaceGUI")
+	if not surfaceGui or not surfaceGui:IsA("SurfaceGui") then
+		return
+	end
+	local multLabel = surfaceGui:FindFirstChild("MoneyMultiplier")
+	if not multLabel or not multLabel:IsA("TextLabel") then
+		return
+	end
+	local baseMult = levelMultipliers[baseLevel] or 1
+	local ownerId = baseModel:GetAttribute(OWNER_ATTRIBUTE)
+	local totalMult = baseMult
+	if typeof(ownerId) == "number" and ownerId > 0 then
+		local ownerPlayer: Player? = nil
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p.UserId == ownerId then
+				ownerPlayer = p
+				break
+			end
+		end
+		if ownerPlayer then
+			totalMult = baseMult * safeGetMoneyServiceMultiplier(ownerPlayer)
+		end
+	end
+	multLabel.Text = formatMultiplierText(totalMult)
+end
+
+local function setBaseUpgradeLabels(baseModel: Model, baseLevel: number)
+	local levelSign = baseModel:FindFirstChild("BaseLevelSign")
+	if not levelSign then
+		return
+	end
+	local baseUpgrade = levelSign:FindFirstChild("BaseUpgrade")
+	if not baseUpgrade then
+		return
+	end
+	local upgradeGui = baseUpgrade:FindFirstChild("UpgradeGUI")
+	if not upgradeGui or not upgradeGui:IsA("SurfaceGui") then
+		return
+	end
+	local button = upgradeGui:FindFirstChildWhichIsA("TextButton", true)
+	if not button then
+		return
+	end
+	local levelLabel = button:FindFirstChild("LevelLabel")
+	local moneyLabel = button:FindFirstChild("MoneyLabel")
+	if levelLabel and levelLabel:IsA("TextLabel") then
+		levelLabel.Text = tostring(baseLevel).. "/".. tostring(MAX_LEVEL)
+	end
+	if moneyLabel and moneyLabel:IsA("TextLabel") then
+		if baseLevel >= MAX_LEVEL then
+			moneyLabel.Text = "MAX"
+		else
+			local nextLevel = baseLevel + 1
+			moneyLabel.Text = formatMoney(levelCosts[nextLevel] or 0)
+		end
+	end
+end
+
+local function saveLevel(userId: number, level: number)
+	pcall(function()
+		store:SetAsync(tostring(userId), clampLevel(level))
+	end)
+end
+
+local function loadLevel(userId: number): number
+	local ok, data = pcall(function()
+		return store:GetAsync(tostring(userId))
+	end)
+	if ok and typeof(data) == "number" then
+		return clampLevel(data)
+	end
+	return 1
+end
+
+local function applyTemplateExactToFolder(targetFolder: Folder, templateFolder: Folder, transform: CFrame, level: number, tagPrefix: string)
+	for _, child in ipairs(templateFolder:GetChildren()) do
+		if child.Name == "Stands" then
+			continue
+		end
+		local clone = child:Clone()
+		clone:SetAttribute("BaseAddonLevel", level)
+		clone:SetAttribute("BaseAddonId", tagPrefix.. "/".. child.Name)
+		clone.Parent = targetFolder
+		applyTransformToInstance(clone, transform)
+	end
+end
+
+local function mergeStandsFromTemplate(baseModel: Model, templateFolder: Folder, transform: CFrame, level: number)
+	local baseStands = getOrCreateStandsFolder(baseModel)
+	local templateStands = templateFolder:FindFirstChild("Stands")
+	if not templateStands or not templateStands:IsA("Folder") then
+		return
+	end
+	for _, stand in ipairs(templateStands:GetChildren()) do
+		if stand:IsA("Model") then
+			local newName = getUniqueStandName(stand.Name, level)
+			if not baseStands:FindFirstChild(newName) then
+				local clone = stand:Clone()
+				clone.Name = newName
+				clone:SetAttribute("BaseAddonLevel", level)
+				clone:SetAttribute("BaseAddonId", "StandAdd:".. templateFolder.Name.. "/".. stand.Name)
+				clone.Parent = baseStands
+				applyTransformToInstance(clone, transform)
+			end
+		end
+	end
+end
+
+local function removeAddonFolders(baseModel: Model)
+	local f2 = baseModel:FindFirstChild("BaseAddons_Level2")
+	if f2 then
+		f2:Destroy()
+	end
+	local f3 = baseModel:FindFirstChild("BaseAddons_Level3")
+	if f3 then
+		f3:Destroy()
+	end
+	local stands = baseModel:FindFirstChild("Stands")
+	if stands and stands:IsA("Folder") then
+		for _, child in ipairs(stands:GetChildren()) do
+			if child:IsA("Model") then
+				local addonLevel = child:GetAttribute("BaseAddonLevel")
+				local addonId = child:GetAttribute("BaseAddonId")
+				if typeof(addonLevel) == "number" and typeof(addonId) == "string" then
+					child:Destroy()
+				end
+			end
+		end
+	end
+end
+
+local function applyBaseLevelToBase(baseModel: Model, level: number)
+	level = clampLevel(level)
+	baseModel:SetAttribute("BaseLevel", level)
+	setMoneyMultiplierLabel(baseModel, level)
+	setBaseUpgradeLabels(baseModel, level)
+	local baseTop = getDirectPart(baseModel, "Top", "Base model")
+	local level2Template = getTemplateFolder(2)
+	local level3Template = getTemplateFolder(3)
+	if level >= 2 then
+		local l2Bottom = getDirectPart(level2Template, "Bottom", "Level2 template")
+		local l2Transform = baseTop.CFrame * l2Bottom.CFrame:Inverse()
+		local f2 = ensureAddonsFolder(baseModel, "BaseAddons_Level2")
+		applyTemplateExactToFolder(f2, level2Template, l2Transform, 2, "Exact:BaseAddons_Level2")
+		mergeStandsFromTemplate(baseModel, level2Template, l2Transform, 2)
+	else
+		local f2 = baseModel:FindFirstChild("BaseAddons_Level2")
+		if f2 then
+			f2:Destroy()
+		end
+	end
+	if level >= 3 then
+		local f2 = baseModel:FindFirstChild("BaseAddons_Level2")
+		if not f2 or not f2:IsA("Folder") then
+			return
+		end
+		local placedL2Top = f2:FindFirstChild("Top")
+		if not placedL2Top or not placedL2Top:IsA("BasePart") then
+			error("Level2 placed Top was not found inside BaseAddons_Level2. Level2 template must include a direct child BasePart named Top.")
+		end
+		local l3Bottom = getDirectPart(level3Template, "Bottom", "Level3 template")
+		local l3Transform = placedL2Top.CFrame * l3Bottom.CFrame:Inverse()
+		local f3 = ensureAddonsFolder(baseModel, "BaseAddons_Level3")
+		applyTemplateExactToFolder(f3, level3Template, l3Transform, 3, "Exact:BaseAddons_Level3")
+		mergeStandsFromTemplate(baseModel, level3Template, l3Transform, 3)
+	else
+		local f3 = baseModel:FindFirstChild("BaseAddons_Level3")
+		if f3 then
+			f3:Destroy()
+		end
+	end
+end
+
+getTemplateFolder(2)
+getTemplateFolder(3)
+
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, gamePassId: number, wasPurchased: boolean)
+	if wasPurchased then
+		refreshMoneyMultiplierSignForPlayer(player)
+	end
+end)
+
+for _, baseModel in ipairs(basesFolder:GetChildren()) do
+	if baseModel:IsA("Model") then
+		baseModel:GetAttributeChangedSignal(OWNER_ATTRIBUTE):Connect(function()
+			local ownerId = baseModel:GetAttribute(OWNER_ATTRIBUTE)
+			if ownerId == 0 or ownerId == nil then
+				removeAddonFolders(baseModel)
+				baseModel:SetAttribute("BaseLevel", 1)
+				setMoneyMultiplierLabel(baseModel, 1)
+				setBaseUpgradeLabels(baseModel, 1)
+			end
+		end)
+	end
+end
+
+Players.PlayerAdded:Connect(function(player: Player)
+	loadedLevelByUserId[player.UserId] = loadLevel(player.UserId)
+	if connsByUserId[player.UserId] then
+		for _, c in ipairs(connsByUserId[player.UserId]) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	connsByUserId[player.UserId] = {}
+	table.insert(connsByUserId[player.UserId], player:GetAttributeChangedSignal("RebirthMultiplier"):Connect(function()
+		refreshMoneyMultiplierSignForPlayer(player)
+	end))
+	table.insert(connsByUserId[player.UserId], player:GetAttributeChangedSignal("FriendBoostPercent"):Connect(function()
+		refreshMoneyMultiplierSignForPlayer(player)
+	end))
+	table.insert(connsByUserId[player.UserId], player:GetAttributeChangedSignal("MoneyMultiplier"):Connect(function()
+		refreshMoneyMultiplierSignForPlayer(player)
+	end))
+	table.insert(connsByUserId[player.UserId], player:GetAttributeChangedSignal(ASSIGNED_BASE_ATTRIBUTE):Connect(function()
+		refreshMoneyMultiplierSignForPlayer(player)
+	end))
+	task.spawn(function()
+		for _ = 1, 50 do
+			if player.Parent ~= Players then
+				return
+			end
+			local baseModel = getPlayersBaseModel(player)
+			if baseModel and baseModel:GetAttribute(OWNER_ATTRIBUTE) == player.UserId then
+				applyBaseLevelToBase(baseModel, loadedLevelByUserId[player.UserId] or 1)
+				refreshMoneyMultiplierSignForPlayer(player)
+				return
+			end
+			task.wait(0.1)
+		end
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player: Player)
+	local level = loadedLevelByUserId[player.UserId] or 1
+	saveLevel(player.UserId, level)
+	loadedLevelByUserId[player.UserId] = nil
+	local conns = connsByUserId[player.UserId]
+	if conns then
+		for _, c in ipairs(conns) do
+			pcall(function()
+				c:Disconnect()
+			end)
+		end
+	end
+	connsByUserId[player.UserId] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local level = loadedLevelByUserId[player.UserId] or 1
+		saveLevel(player.UserId, level)
+	end
+end)
+
+remote.OnServerEvent:Connect(function(player: Player, action: any)
+	if action ~= "UpgradeBase" then
+		return
+	end
+	local baseModel = getPlayersBaseModel(player)
+	if not baseModel or not baseModel:IsA("Model") then
+		return
+	end
+	if baseModel:GetAttribute(OWNER_ATTRIBUTE) ~= player.UserId then
+		return
+	end
+	local currentLevel = clampLevel(loadedLevelByUserId[player.UserId] or baseModel:GetAttribute("BaseLevel"))
+	if currentLevel >= MAX_LEVEL then
+		return
+	end
+	local nextLevel = currentLevel + 1
+	local cost = clampMoney(levelCosts[nextLevel] or 0)
+	local moneyValue = getMoneyValue(player)
+	if not moneyValue then
+		return
+	end
+	if moneyValue.Value < cost then
+		remote:FireClient(player, "NotEnough")
+		return
+	end
+	moneyValue.Value = clampMoney(moneyValue.Value - cost)
+	loadedLevelByUserId[player.UserId] = nextLevel
+	saveLevel(player.UserId, nextLevel)
+	applyBaseLevelToBase(baseModel, nextLevel)
+end)
