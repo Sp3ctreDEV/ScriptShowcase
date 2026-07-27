@@ -1,0 +1,234 @@
+local Players = game:GetService("Players")
+
+local basesFolder = workspace:WaitForChild("Bases")
+
+local OWNER_ATTRIBUTE = "OwnerUserId"
+local ASSIGNED_BASE_ATTRIBUTE = "AssignedBaseName"
+
+local playerToBase: { [Player]: Model } = {}
+
+local function getBaseNumber(baseName: string): number?
+	local numberText = string.match(baseName, "^Base(%d+)$")
+	if not numberText then
+		return nil
+	end
+	return tonumber(numberText)
+end
+
+local function getBasesSorted(): { Model }
+	local entries = {}
+	for _, child in ipairs(basesFolder:GetChildren()) do
+		if child:IsA("Model") then
+			local n = getBaseNumber(child.Name)
+			if n then
+				table.insert(entries, { model = child, n = n })
+			end
+		end
+	end
+	table.sort(entries, function(a, b)
+		return a.n < b.n
+	end)
+	local result: { Model } = {}
+	for _, entry in ipairs(entries) do
+		table.insert(result, entry.model)
+	end
+	return result
+end
+
+local function resolveBaseObjects(baseModel: Model): (BasePart, TextLabel)
+	local spawnPart = baseModel:FindFirstChild("Spawn")
+	if not spawnPart or not spawnPart:IsA("BasePart") then
+		error("Base is missing a BasePart named Spawn: ".. baseModel:GetFullName())
+	end
+	local baseSign = baseModel:FindFirstChild("BaseSign")
+	if not baseSign then
+		error("Base is missing BaseSign: ".. baseModel:GetFullName())
+	end
+	local main = baseSign:FindFirstChild("Main")
+	if not main or not main:IsA("BasePart") then
+		error("BaseSign is missing a BasePart named Main: ".. baseSign:GetFullName())
+	end
+	local surfaceGui = main:FindFirstChild("SurfaceGUI")
+	if not surfaceGui or not surfaceGui:IsA("SurfaceGui") then
+		error("Main is missing a SurfaceGui instance named SurfaceGUI: ".. main:GetFullName())
+	end
+	local baseLabel = surfaceGui:FindFirstChild("BaseLabel")
+	if not baseLabel or not baseLabel:IsA("TextLabel") then
+		error("SurfaceGUI is missing a TextLabel named BaseLabel: ".. surfaceGui:GetFullName())
+	end
+	return spawnPart, baseLabel
+end
+
+local function findAvailableBase(): Model?
+	for _, baseModel in ipairs(getBasesSorted()) do
+		local owner = baseModel:GetAttribute(OWNER_ATTRIBUTE)
+		if owner == nil or owner == 0 then
+			return baseModel
+		end
+	end
+	return nil
+end
+
+local function isValidRarity(r: any): boolean
+	if typeof(r) ~= "string" then
+		return false
+	end
+	return r == "Common" or r == "Uncommon" or r == "Rare" or r == "Epic" or r == "Legendary" or r == "Mythic" or r == "Secret"
+end
+
+local function getPlacedBrainrotFromStand(standModel: Model): Model?
+	for _, child in ipairs(standModel:GetChildren()) do
+		if child:IsA("Model") then
+			local r = child:GetAttribute("Rarity")
+			if isValidRarity(r) then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+local function getClaimMoneyLabel(standModel: Model): TextLabel?
+	local claimPart = standModel:FindFirstChild("Claim")
+	if not claimPart or not claimPart:IsA("BasePart") then
+		return nil
+	end
+	local moneyGui = claimPart:FindFirstChild("MoneyGUI")
+	if not moneyGui or not moneyGui:IsA("SurfaceGui") then
+		return nil
+	end
+	local textButton = moneyGui:FindFirstChild("TextButton")
+	if not textButton or not textButton:IsA("TextButton") then
+		return nil
+	end
+	local moneyLabel = textButton:FindFirstChild("MoneyLabel")
+	if not moneyLabel or not moneyLabel:IsA("TextLabel") then
+		return nil
+	end
+	return moneyLabel
+end
+
+local function getUpgradeButton(standModel: Model): TextButton?
+	local upgradeFolder = standModel:FindFirstChild("Upgrade")
+	if not upgradeFolder then
+		return nil
+	end
+	local upgradeGui = upgradeFolder:FindFirstChild("UpgradeGUI")
+	if not upgradeGui or not upgradeGui:IsA("SurfaceGui") then
+		return nil
+	end
+	local textButton = upgradeGui:FindFirstChildWhichIsA("TextButton", true)
+	if textButton and textButton:IsA("TextButton") then
+		return textButton
+	end
+	return nil
+end
+
+local function clearAllBrainrotsFromBase(baseModel: Model)
+	if not baseModel or baseModel.Parent == nil then
+		return
+	end
+	local standsFolder = baseModel:FindFirstChild("Stands")
+	if not standsFolder or not standsFolder:IsA("Folder") then
+		return
+	end
+	for _, standModel in ipairs(standsFolder:GetChildren()) do
+		if standModel:IsA("Model") then
+			local placedBrainrot = getPlacedBrainrotFromStand(standModel)
+			if placedBrainrot then
+				placedBrainrot:Destroy()
+			end
+			standModel:SetAttribute("BrainrotName", nil)
+			standModel:SetAttribute("BrainrotRarity", nil)
+			standModel:SetAttribute("BrainrotLevel", nil)
+			standModel:SetAttribute("BrainrotMutation", nil)
+			local moneyLabel = getClaimMoneyLabel(standModel)
+			if moneyLabel then
+				moneyLabel.Text = "$0"
+			end
+			local upgradeButton = getUpgradeButton(standModel)
+			if upgradeButton then
+				local levelLabel = upgradeButton:FindFirstChild("LevelLabel")
+				local upgMoneyLabel = upgradeButton:FindFirstChild("MoneyLabel")
+				if levelLabel and levelLabel:IsA("TextLabel") then
+					levelLabel.Text = ""
+				end
+				if upgMoneyLabel and upgMoneyLabel:IsA("TextLabel") then
+					upgMoneyLabel.Text = ""
+				end
+			end
+			local standPart = standModel:FindFirstChild("StandPart")
+			if standPart and standPart:IsA("BasePart") then
+				local prompt = standPart:FindFirstChild("StandInteractPrompt")
+				if prompt and prompt:IsA("ProximityPrompt") then
+					prompt.ActionText = "Place"
+				end
+			end
+		end
+	end
+end
+
+local function setBaseOwner(baseModel: Model, player: Player)
+	baseModel:SetAttribute(OWNER_ATTRIBUTE, player.UserId)
+	local _, baseLabel = resolveBaseObjects(baseModel)
+	baseLabel.Text = player.Name.. "'s Base"
+end
+
+local function clearBaseOwner(baseModel: Model)
+	clearAllBrainrotsFromBase(baseModel)
+	baseModel:SetAttribute(OWNER_ATTRIBUTE, 0)
+	local _, baseLabel = resolveBaseObjects(baseModel)
+	baseLabel.Text = "Available"
+end
+
+local function teleportCharacterToBaseSpawn(character: Model, baseModel: Model)
+	local spawnPart = resolveBaseObjects(baseModel)
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	if not hrp or not hrp:IsA("BasePart") then
+		hrp = character:WaitForChild("HumanoidRootPart", 10)
+	end
+	if not hrp or not hrp:IsA("BasePart") then
+		return
+	end
+	local yOffset = (spawnPart.Size.Y * 0.5) + 3
+	local targetCFrame = spawnPart.CFrame * CFrame.new(0, yOffset, 0)
+	character:PivotTo(targetCFrame)
+end
+
+for _, baseModel in ipairs(getBasesSorted()) do
+	clearBaseOwner(baseModel)
+	resolveBaseObjects(baseModel)
+end
+
+Players.PlayerAdded:Connect(function(player: Player)
+	player:SetAttribute(ASSIGNED_BASE_ATTRIBUTE, nil)
+	local baseModel = findAvailableBase()
+	if not baseModel then
+		player:Kick("No bases are available in this server right now. Please join a different server.")
+		return
+	end
+	playerToBase[player] = baseModel
+	setBaseOwner(baseModel, player)
+	player:SetAttribute(ASSIGNED_BASE_ATTRIBUTE, baseModel.Name)
+	player.CharacterAdded:Connect(function(character: Model)
+		local assignedBase = playerToBase[player]
+		if assignedBase then
+			teleportCharacterToBaseSpawn(character, assignedBase)
+		end
+	end)
+	if player.Character then
+		local assignedBase = playerToBase[player]
+		if assignedBase then
+			teleportCharacterToBaseSpawn(player.Character, assignedBase)
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player: Player)
+	local baseModel = playerToBase[player]
+	playerToBase[player] = nil
+	player:SetAttribute(ASSIGNED_BASE_ATTRIBUTE, nil)
+	if baseModel then
+		clearBaseOwner(baseModel)
+	end
+end)
